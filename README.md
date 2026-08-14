@@ -70,20 +70,27 @@ The push script applies the full property contract, including
 (`hw_incus_boot_from_volume`, `hw_incus_rootfs_idmap_provenance`,
 `hw_incus_rootfs_layout`).
 
-## Adding an image
+## Coverage: everything upstream publishes that qualifies
 
-Add a matrix entry in `.github/workflows/build.yaml`:
+The build matrix is **discovered at run time** from the `images:`
+remote (the authoritative simplestreams catalog, not the lagging HTML
+page): every image with `variant=cloud`, Incus container support and
+`x86_64` joins the matrix automatically — new upstream releases appear
+on the next run, retired ones drop out. As of 2026-08 that is ~41
+images across ubuntu, debian, devuan, kali, mint, alpine, almalinux,
+rockylinux, centos-stream, oracle, fedora, openeuler, opensuse and
+archlinux.
 
-```yaml
-- name: debian-trixie-cloud-incus
-  source: images:debian/trixie/cloud
-  packages: fuse2fs jq        # e2fsprogs-extra on Alpine <=3.21
-  bfv_size_mib: 2048
-```
+Per-family rules (packages to install, BFV size) live in the
+`discover` job of `.github/workflows/build.yaml`. A distribution
+without a rule is skipped with a `SKIP` log line, never silently. A
+family whose fuse2fs package name is wrong fails its build at the
+`data_volume_fuse == true` validation instead of publishing a
+capability-stripped image. Individual distro failures do not block the
+release of the rest.
 
-Keep releases pinned (`ubuntu/noble`, not `ubuntu`) — the alias still
-tracks the latest *build* of that release. Remember the openstack-incus
-rule: a new image revision is not production-ready until it passes the
-image acceptance matrix (create/delete, BFV, data volumes, hard reboot,
-snapshot/restore, and — only if advertised — the live-migration
-matrix). Publishing here is build evidence, not qualification.
+Remember the openstack-incus rule: a new image revision is not
+production-ready until it passes the image acceptance matrix
+(create/delete, BFV, data volumes, hard reboot, snapshot/restore, and —
+only if advertised — the live-migration matrix). Publishing here is
+build evidence, not qualification.

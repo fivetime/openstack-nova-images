@@ -90,9 +90,10 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             chroot "$rootfs" rc-update add sshd default
         fi
-        rm -f "$rootfs"/etc/ssh/ssh_host_*
         rm -f "$rootfs/etc/resolv.conf"
-    else
+    elif [[ -x "$rootfs/usr/bin/apt-get" ]]; then
+        # Debian family: debian, ubuntu, devuan, kali, mint. Devuan has no
+        # systemd; its openssh-server postinst registers the sysv service.
         chroot "$rootfs" apt-get -o Acquire::ForceIPv4=true update
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             packages+=(openssh-server)
@@ -102,17 +103,66 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
                 apt-get -o Acquire::ForceIPv4=true install -y \
                 --no-install-recommends "${packages[@]}"
         fi
-        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+        if [[ "$PREINSTALL_SSH" == "true" &&
+              -d "$rootfs/usr/lib/systemd" ]]; then
             chroot "$rootfs" systemctl enable ssh
         fi
-
-        # Instances must generate unique host identities on first boot.
-        rm -f "$rootfs"/etc/ssh/ssh_host_*
         rm -rf "$rootfs/var/lib/apt/lists"/*
         rm -f "$rootfs/etc/resolv.conf"
-        ln -s ../run/systemd/resolve/stub-resolv.conf \
-            "$rootfs/etc/resolv.conf"
+        if [[ -d "$rootfs/usr/lib/systemd" ]]; then
+            ln -s ../run/systemd/resolve/stub-resolv.conf \
+                "$rootfs/etc/resolv.conf"
+        fi
+    elif [[ -x "$rootfs/usr/bin/dnf" ]]; then
+        # RHEL family: almalinux, rockylinux, centos-stream, oracle,
+        # fedora, openeuler.
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            packages+=(openssh-server)
+        fi
+        if ((${#packages[@]})); then
+            chroot "$rootfs" dnf install -y \
+                --setopt=install_weak_deps=False "${packages[@]}"
+        fi
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            chroot "$rootfs" systemctl enable sshd
+        fi
+        chroot "$rootfs" dnf clean all
+        rm -f "$rootfs/etc/resolv.conf"
+    elif [[ -x "$rootfs/usr/bin/zypper" ]]; then
+        # SUSE family: opensuse leap/tumbleweed.
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            packages+=(openssh)
+        fi
+        if ((${#packages[@]})); then
+            chroot "$rootfs" zypper --non-interactive install \
+                --no-recommends "${packages[@]}"
+        fi
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            chroot "$rootfs" systemctl enable sshd
+        fi
+        chroot "$rootfs" zypper --non-interactive clean --all
+        rm -f "$rootfs/etc/resolv.conf"
+    elif [[ -x "$rootfs/usr/bin/pacman" ]]; then
+        # Arch: the upstream cloud image ships an initialized keyring.
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            packages+=(openssh)
+        fi
+        if ((${#packages[@]})); then
+            chroot "$rootfs" pacman -Sy --noconfirm --needed \
+                "${packages[@]}"
+        fi
+        if [[ "$PREINSTALL_SSH" == "true" ]]; then
+            chroot "$rootfs" systemctl enable sshd
+        fi
+        rm -rf "$rootfs/var/cache/pacman/pkg"/*
+        rm -f "$rootfs/etc/resolv.conf"
+    else
+        echo "No supported package manager found in $SOURCE rootfs" >&2
+        exit 1
     fi
+
+    # Instances must generate unique host identities on first boot.
+    rm -f "$rootfs"/etc/ssh/ssh_host_*
 
     cleanup_chroot_mounts
     trap - EXIT

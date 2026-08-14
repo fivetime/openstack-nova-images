@@ -1,9 +1,14 @@
 name: Build guest images
 
-# Builds nova-incus guest images from the newest upstream builds on
-# images.linuxcontainers.org (the "images:" remote always resolves an
-# alias to its latest build; the exact fingerprint/serial is recorded in
-# each manifest). Artifacts follow the openstack-incus image contract:
+# Builds nova-incus guest images for EVERY image the upstream server
+# publishes that meets the driver's criteria: variant=cloud (cloud-init),
+# Incus container support, x86_64. The list is discovered at run time
+# from the images: remote (the same simplestreams catalog the incus
+# client consumes), so new upstream releases join the matrix
+# automatically and retired ones drop out. Distributions without a
+# package rule are skipped with a log line, never silently.
+#
+# Artifacts follow the openstack-incus image contract:
 #
 #   <name>.tar.gz        unified Incus tar (metadata.yaml/templates/rootfs)
 #   <name>-bfv.raw.zst   ext4 BFV root (top-level rootfs/ + .incus-idmap)
@@ -31,23 +36,92 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - name: Install Incus and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends incus jq
+          sudo incus admin init --preseed <<'EOF'
+          networks: []
+          storage_pools: []
+          EOF
+
+      - name: Generate image matrix from the images remote
+        id: gen
+        run: |
+          sudo incus image list images: --format json > catalog.json
+
+          jq -r '.[]
+              | select(.type == "container" and .architecture == "x86_64")
+              | [.aliases[].name][]
+              | select(test("^[a-z0-9]+/[^/]+/cloud$"))' catalog.json \
+            | sort -u > aliases.txt
+
+          matrix='[]'
+          add() {
+            matrix=$(jq --arg n "$1" --arg s "$2" --arg p "$3" \
+              --argjson b "$4" \
+              '. + [{name:$n, source:$s, packages:$p, bfv_size_mib:$b}]' \
+              <<<"$matrix")
+          }
+
+          while read -r alias; do
+            os=${alias%%/*}
+            rest=${alias#*/}
+            release=${rest%%/*}
+            case "$os" in
+              ubuntu|debian|devuan)
+                pkgs="fuse2fs jq"; size=2048 ;;
+              kali|mint)
+                pkgs="fuse2fs jq"; size=3072 ;;
+              alpine)
+                # fuse2fs became its own package in 3.22.
+                if [[ "$release" == "3.21" ]]; then
+                  pkgs="e2fsprogs-extra jq"
+                else
+                  pkgs="fuse2fs jq"
+                fi
+                size=512 ;;
+              almalinux|rockylinux|centos|oracle|fedora|openeuler)
+                pkgs="fuse2fs jq"; size=3072 ;;
+              opensuse)
+                pkgs="fuse2fs jq"; size=3072 ;;
+              archlinux)
+                # Arch does not split fuse2fs out of e2fsprogs.
+                pkgs="e2fsprogs jq"; size=2048 ;;
+              *)
+                echo "SKIP $alias: no package rule for distro '$os'" >&2
+                continue ;;
+            esac
+            release_slug=$(tr '[:upper:]' '[:lower:]' <<<"$release")
+            add "${os}-${release_slug}-cloud-incus" "images:$alias" \
+              "$pkgs" "$size"
+          done < aliases.txt
+
+          total=$(jq length <<<"$matrix")
+          ((total > 0)) || { echo "empty matrix" >&2; exit 1; }
+          {
+            echo "## Discovered $total buildable images"
+            jq -r '.[] | "- \(.source) -> \(.name) [\(.packages)]"' \
+              <<<"$matrix"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "matrix=$(jq -c . <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: ubuntu-noble-24.04-cloud-incus
-            source: images:ubuntu/noble/cloud
-            packages: fuse2fs jq
-            bfv_size_mib: 2048
-          - name: alpine-3.22-cloud-incus
-            source: images:alpine/3.22/cloud
-            # Alpine 3.22 ships fuse2fs as its own package; on <=3.21 it
-            # lived inside e2fsprogs-extra.
-            packages: fuse2fs jq
-            bfv_size_mib: 512
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -118,7 +192,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    # Publish whatever subset built successfully; individual distro
+    # failures must not block the rest of the fleet.
+    needs: [discover, build]
+    if: ${{ !cancelled() && needs.discover.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -131,11 +208,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TOTAL: ${{ needs.discover.outputs.total }}
         run: |
           cd dist
+          built=$(ls -- *.manifest.json | wc -l)
           sha256sum -- * > SHA256SUMS
           tag="guest-images-$(date -u +%Y%m%d)-${{ github.run_number }}"
           {
+            echo "Built $built of $TOTAL discovered images."
+            echo
             echo "| Image | Source | Serial | fuse2fs |"
             echo "|---|---|---|---|"
             for m in *.manifest.json; do
@@ -157,11 +238,13 @@ jobs:
     # runner label that can reach Keystone/Glance), or per-run via the
     # workflow_dispatch input.
     if: >-
-      vars.PUSH_TO_GLANCE == 'true' ||
-      (github.event_name == 'workflow_dispatch' && inputs.push_to_glance)
-    needs: build
+      ${{ !cancelled() &&
+          (vars.PUSH_TO_GLANCE == 'true' ||
+           (github.event_name == 'workflow_dispatch' &&
+            inputs.push_to_glance)) }}
+    needs: [discover, build]
     runs-on: ${{ vars.GLANCE_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
       OS_PROJECT_NAME: ${{ secrets.OS_PROJECT_NAME }}
