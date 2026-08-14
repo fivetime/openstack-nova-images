@@ -50,6 +50,10 @@ esac
 export LIBGUESTFS_BACKEND=direct
 
 customize_args=(-a "$disk")
+# The guest resolv.conf is a dangling systemd-resolved symlink inside
+# the appliance; point it at the SLIRP resolver while installing.
+customize_args+=(--run-command \
+    'rm -f /etc/resolv.conf; printf "nameserver 10.0.2.3\nnameserver 1.1.1.1\n" > /etc/resolv.conf')
 if [[ -n "$PRE_COMMAND" ]]; then
     customize_args+=(--run-command "$PRE_COMMAND")
 fi
@@ -61,6 +65,8 @@ customize_args+=(
         || rc-update add qemu-guest-agent default'
     # Instances must generate unique host identities on first boot.
     --run-command 'rm -f /etc/ssh/ssh_host_*'
+    # Restore the distro resolver arrangement.
+    --run-command 'rm -f /etc/resolv.conf; if [ -d /usr/lib/systemd ]; then ln -s ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf; fi'
 )
 virt-customize "${customize_args[@]}"
 
