@@ -142,7 +142,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            incus qemu-utils jq file
+            incus qemu-utils jq file psmisc
           sudo incus admin init --preseed <<'EOF'
           networks: []
           storage_pools:

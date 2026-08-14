@@ -136,8 +136,12 @@ elif [[ -x "$rootfs/usr/bin/pacman" ]]; then
         sleep 15
     done
     sed -i 's/^#CheckSpace/CheckSpace/' "$rootfs/etc/pacman.conf"
-    chroot "$rootfs" systemctl enable qemu-guest-agent.service
-    chroot "$rootfs" gpgconf --kill all || true
+    # Arch's qemu-guest-agent unit has no [Install] section; a udev
+    # rule starts it when the virtio-serial port appears, so there is
+    # nothing to enable. Kill the keyring agents on their real homedir
+    # or they keep the mount busy.
+    chroot "$rootfs" gpgconf --homedir /etc/pacman.d/gnupg \
+        --kill all || true
     rm -rf "$rootfs/var/cache/pacman/pkg"/*
 else
     echo "No supported package manager found in $SOURCE rootfs" >&2
@@ -166,6 +170,10 @@ done
 
 sync
 umount -l "$rootfs/sys" "$rootfs/proc" "$rootfs/dev"
+# Kill any stray chroot processes (package-manager agents) that would
+# keep the root mount busy.
+fuser -k -m "$rootfs" 2>/dev/null || true
+sleep 1
 umount "$rootfs"
 losetup -d "$loop_device"
 loop_device=
