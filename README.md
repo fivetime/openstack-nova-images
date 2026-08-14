@@ -1,96 +1,133 @@
-# nova-incus-image
+# openstack-nova-images
 
-Automated guest-image pipeline for the
-[openstack-incus](https://github.com/fivetime/openstack-incus) Nova
-driver. Every run inherits the **newest upstream build** from
-`images.linuxcontainers.org` (the `images:` remote resolves aliases to
-the latest daily build), installs the packages the driver's image
-contract requires, and produces the two artifacts the driver accepts:
+为 [openstack-incus](https://github.com/fivetime/openstack-incus) Nova
+驱动自动构建 guest 镜像的流水线。每次运行从
+`images.linuxcontainers.org`（incus 客户端内置的 `images:` remote）
+继承**最新的官方每日构建**，安装驱动镜像契约要求的软件包，产出驱动
+认可的两种制品。
 
-| Artifact | Glance format | Purpose |
+## 两种制品，两条根盘路径
+
+同一份定制后的 rootfs，封装成两个 Glance 制品，分别服务驱动的两种
+根盘模型，**不可互换**：
+
+| | `<name>.tar.gz`（unified tar） | `<name>-bfv.raw.zst`（ext4 raw） |
 |---|---|---|
-| `<name>.tar.gz` | raw/bare unified tar (`metadata.yaml` + `templates/` + `rootfs/`) | Incus-managed guest root |
-| `<name>-bfv.raw.zst` | raw/bare ext4 with top-level `rootfs/` + `.incus-idmap` | Cinder boot-from-volume root (RBD CoW clone) |
+| 根盘模型 | 本地/临时根盘（Nova 管理，大小取 Flavor `root_gb`） | 引导卷 BFV（根盘是 Cinder RBD 卷，cephext 驱动"认领"卷内 `rootfs/`） |
+| 消费方式 | 驱动交给 incusd 导入为 Incus 镜像 | Glance RBD 池 → Cinder CoW 克隆（零拷贝，有 RBD parent） |
+| 内容结构 | `metadata.yaml` + `templates/` + `rootfs/` | 可直接挂载的 ext4，顶层 `rootfs/` 目录 + `.incus-idmap` 标记（0600） |
+| 生命周期 | 跟实例走 | 归 Cinder，可保留可另挂 |
+| 热迁移 | CRIU + 根盘传输 | CRIU + 共享 Ceph 零拷贝交接 |
 
-A `<name>.manifest.json` records the upstream fingerprint/serial and
-capability flags for provenance.
+**禁止**：把 unified tar 当 BFV raw 上传（克隆出的卷不是文件系统）；
+把 BFV raw 走镜像导入（incusd 不认）；用普通 VM qcow2 充当系统容器
+根。每个镜像另附 `<name>.manifest.json`，记录上游
+fingerprint/serial 和能力标志，供溯源与推送脚本使用。
 
-Do **not** upload qcow2 VM disks: the driver only accepts the two
-layouts above (see openstack-incus `doc/source/image_build_guide.rst`).
+## 为什么要定制镜像
 
-## Why the images are customized
+* **fuse2fs 是 Cinder 数据卷的硬性要求。** 驱动在创建带初始数据卷的
+  实例时要求 Glance 属性 `hw_incus_data_volume_fuse=true`，attach 时
+  还会在 guest 内实测 `which fuse2fs`。租户 ext4 在用户态解析，永不
+  进入计算节点内核。guest 自行运行 fuse2fs 是唯一兼容 CRIU 热迁移的
+  路径。
+* **cloud-init** 来自上游 `cloud` variant（user-data、密钥对、
+  Neutron 网络配置）。
+* **SSH** 预装并删除 host key，实例首次启动生成唯一身份。
+* **Manila 不需要任何 guest 侧定制**——共享在计算宿主侧挂载，以
+  Incus disk 设备暴露进容器。
+* CI 对每个镜像校验 `rootfs/sbin/init`、fuse2fs 能力、
+  `.incus-idmap`（0600）、15% 余量和 `e2fsck`。
 
-* **`fuse2fs` is mandatory for Cinder data volumes.** The driver
-  refuses to build an instance with initial data volumes unless the
-  Glance image carries `hw_incus_data_volume_fuse=true`, and re-checks
-  the executable inside the guest at attach time. Tenant ext4 is parsed
-  in userspace, never by the compute kernel. The default (guest runs
-  `fuse2fs` itself) is the only path compatible with CRIU live
-  migration.
-* **cloud-init** comes from the upstream `cloud` variant (user-data,
-  keypairs, Neutron network config).
-* **SSH** is preinstalled with host keys removed so each instance
-  generates a unique identity on first boot.
-* **Manila needs nothing in the guest** — shares are staged on the
-  compute host and exposed as Incus disk devices.
-* The CI build validates `rootfs/sbin/init`, the fuse2fs capability,
-  the `.incus-idmap` marker (0600), 15% free headroom, and `e2fsck`.
+## 覆盖面：上游有什么就构建什么
 
-## Workflow
+构建矩阵由 `discover` job **运行时发现**：查询 `images:` remote 的
+权威 simplestreams 目录（不是滞后的网页），凡满足
+`variant=cloud` + Incus 容器支持 + `x86_64` 的镜像自动入列——上游
+新版本下次运行自动加入，下架自动退出。同一镜像的数字/代号双别名
+（`debian/12` = `debian/bookworm`）按 fingerprint 去重，优先代号。
+截至 2026-08 共 **41 个镜像**，覆盖 ubuntu、debian、devuan、kali、
+mint、alpine、almalinux、rockylinux、centos-stream、oracle、
+fedora、openeuler、opensuse、archlinux 十四族。
 
-`.github/workflows/build.yaml` runs monthly (1st, 00:00 UTC) and on
-manual dispatch. It always publishes a GitHub release with checksums.
+各族的装包规则和 BFV 大小写在 workflow 的 `discover` job 里。没有
+规则的新发行版会打 `SKIP` 日志跳过，绝不静默。个别发行版失败不阻塞
+其余镜像发布。
 
-### Pushing to Glance
+**fuse2fs 包名情报**（均由 CI 硬校验实测得出）：
 
-GitHub-hosted runners **cannot reach a private OpenStack endpoint**
-(e.g. a cluster on 10.x.x.x), so the Glance push is a separate opt-in
-job. Choose one:
+| 族 | 包名 | 说明 |
+|---|---|---|
+| debian/ubuntu/devuan/kali/mint | `fuse2fs` | |
+| alpine（3.21+ 全部） | `fuse2fs` | 独立包；`e2fsprogs-extra` 从来不含它 |
+| archlinux | `fuse2fs` | 2026-03 起从 e2fsprogs 拆出的独立 core 包 |
+| EL 系（alma/rocky/centos/oracle/openeuler） | `e2fsprogs` + 兜底尝试独立名 | 实测全部拿到 fuse2fs，无需收窄能力 |
+| fedora/opensuse | `e2fsprogs` / `fuse2fs` | |
 
-1. **Self-hosted runner** with network access to Keystone/Glance:
-   register it, set repo variable `GLANCE_RUNNER` to its label, set
-   `PUSH_TO_GLANCE=true`, and configure the `OS_*` secrets
-   (`OS_AUTH_URL`, `OS_PROJECT_NAME`, `OS_PROJECT_DOMAIN_NAME`,
-   `OS_USERNAME`, `OS_USER_DOMAIN_NAME`, `OS_PASSWORD`,
-   `OS_REGION_NAME`). Optional: variable `GLANCE_IMAGE_STORE` to route
-   uploads into an explicit store (production BFV should name the RBD
-   store so Cinder can CoW-clone).
-2. **Manual from a control node** that has `openstack` CLI:
+若某发行版确实无法提供 fuse2fs，该镜像以
+`data_volume_fuse=false` 发布（manifest 与 release 表格可见），
+Glance 不打对应属性，驱动会拒绝为其挂初始数据卷——能力收窄而非
+造假，符合驱动契约。
 
-   ```bash
-   gh release download <tag> --dir dist --repo fivetime/nova-incus-image
-   source /etc/openstack/admin-openrc
-   IMAGE_STORE=rbd bash scripts/push-to-glance.sh dist
-   ```
+## 工作流
 
-The push script applies the full property contract, including
-`hypervisor_type=lxd` (what nova-incus computes report — required by
-`ImagePropertiesFilter` in mixed libvirt/incus clusters; override with
-`HYPERVISOR_TYPE=` if your deployment differs) and the BFV properties
-(`hw_incus_boot_from_volume`, `hw_incus_rootfs_idmap_provenance`,
-`hw_incus_rootfs_layout`).
+`.github/workflows/build.yaml`，每月 1 号 00:00 UTC 自动运行，也可
+手动触发。job 编排：
 
-## Coverage: everything upstream publishes that qualifies
+```
+discover ─→ prepare（建 draft release）─→ build ×41（各自上传产物）
+                                              └→ finalize-release（聚合校验和、发布）
+                                              └→ push-to-glance（默认关闭）
+```
 
-The build matrix is **discovered at run time** from the `images:`
-remote (the authoritative simplestreams catalog, not the lagging HTML
-page): every image with `variant=cloud`, Incus container support and
-`x86_64` joins the matrix automatically — new upstream releases appear
-on the next run, retired ones drop out. As of 2026-08 that is ~41
-images across ubuntu, debian, devuan, kali, mint, alpine, almalinux,
-rockylinux, centos-stream, oracle, fedora, openeuler, opensuse and
-archlinux.
+产物由每个 build job **直接上传到 release**（41 组共 ~25GB，聚合到
+单机会耗尽 runner 磁盘），收尾 job 只聚合 KB 级的 manifest 与
+sha256。
 
-Per-family rules (packages to install, BFV size) live in the
-`discover` job of `.github/workflows/build.yaml`. A distribution
-without a rule is skipped with a `SKIP` log line, never silently. A
-family whose fuse2fs package name is wrong fails its build at the
-`data_volume_fuse == true` validation instead of publishing a
-capability-stripped image. Individual distro failures do not block the
-release of the rest.
+## 推送到 Glance
 
-Remember the openstack-incus rule: a new image revision is not
-production-ready until it passes the image acceptance matrix
-(create/delete, BFV, data volumes, hard reboot, snapshot/restore, and —
-only if advertised — the live-migration matrix). Publishing here is
-build evidence, not qualification.
+GitHub 托管 runner **无法访问私网 OpenStack 端点**，因此推送是独立
+的可选环节，两种方式：
+
+**方式一：控制节点手动推送**（适合私网集群）：
+
+```bash
+gh release download <tag> --dir dist --repo fivetime/openstack-nova-images
+source /etc/openstack/admin-openrc
+IMAGE_STORE=rbd bash scripts/push-to-glance.sh dist
+```
+
+**方式二：自建 runner 自动推送**：注册一台能访问
+Keystone/Glance 的 runner，设置仓库变量 `GLANCE_RUNNER`（runner
+标签）、`PUSH_TO_GLANCE=true`，配置 `OS_*` secrets
+（`OS_AUTH_URL`、`OS_PROJECT_NAME`、`OS_PROJECT_DOMAIN_NAME`、
+`OS_USERNAME`、`OS_USER_DOMAIN_NAME`、`OS_PASSWORD`、
+`OS_REGION_NAME`），可选变量 `GLANCE_IMAGE_STORE` 指定后端存储。
+注意完整资产集有数十 GB，自建 runner 需备足磁盘。
+
+推送脚本自动应用完整属性契约：
+
+* `hypervisor_type=lxd`——nova-incus 计算节点上报的值，混合
+  libvirt/incus 集群的 `ImagePropertiesFilter` 调度必需（部署不同
+  可用 `HYPERVISOR_TYPE=` 覆盖）；
+* fuse2fs 实测为真时打 `hw_incus_data_volume_fuse=true`；
+* BFV 制品追加 `hw_incus_boot_from_volume=true`、
+  `hw_incus_rootfs_idmap_provenance=v1`、
+  `hw_incus_rootfs_layout=rootfs-directory`；
+* 生产 BFV 必须用 `IMAGE_STORE=` 明确指定 RBD 后端，Cinder 才能
+  CoW 克隆（否则退化为下载导入的全量拷贝）。
+
+## 脚本
+
+| 脚本 | 职责 |
+|---|---|
+| `scripts/build-guest-image.sh` | 从 `images:` remote 复制最新构建，chroot 装包（apk/apt/dnf/zypper/pacman 五分支），重打 unified tar，写 manifest |
+| `scripts/build-bfv-image.sh` | unified tar → ext4 raw（`rootfs/` 布局 + `.incus-idmap`），校验余量与 `e2fsck` |
+| `scripts/push-to-glance.sh` | 按 manifest 把两种制品带属性推入 Glance，支持多 store 的 copy-image 导入 |
+
+## 发布 ≠ 资格
+
+牢记 openstack-incus 的规矩：新镜像修订在通过镜像验收矩阵（创建/
+删除、BFV、数据卷、硬重启、快照恢复，以及——仅在宣传时——完整热
+迁移矩阵）之前，不算生产就绪。本仓库的 release 是**构建证据**，
+不是资格认证。
