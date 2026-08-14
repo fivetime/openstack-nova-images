@@ -54,32 +54,41 @@ jobs:
 
       - name: Generate image matrix from the images remote
         id: gen
+        # Explicit bash shell: the default runner shell lacks pipefail,
+        # which once let a mid-stream jq failure truncate this list to a
+        # single alias while the step still reported success.
+        shell: bash
         run: |
           sudo incus image list images: --format json > catalog.json
 
           jq -r '.[]
               | select(.type == "container" and .architecture == "x86_64")
-              | [.aliases[].name][]
+              | (.aliases // [])[].name
               | select(test("^[a-z0-9]+/[^/]+/cloud$"))' catalog.json \
             | sort -u > aliases.txt
 
           matrix='[]'
           add() {
             matrix=$(jq --arg n "$1" --arg s "$2" --arg p "$3" \
-              --argjson b "$4" \
-              '. + [{name:$n, source:$s, packages:$p, bfv_size_mib:$b}]' \
+              --argjson b "$4" --argjson f "$5" \
+              '. + [{name:$n, source:$s, packages:$p, bfv_size_mib:$b,
+                     fuse_required:$f}]' \
               <<<"$matrix")
           }
 
+          # fuse=true families MUST end up with an executable fuse2fs
+          # (build fails otherwise). fuse=false families publish with the
+          # data-volume capability narrowed when the distro cannot
+          # provide fuse2fs — visible in the manifest, never silent.
           while read -r alias; do
             os=${alias%%/*}
             rest=${alias#*/}
             release=${rest%%/*}
             case "$os" in
               ubuntu|debian|devuan)
-                pkgs="fuse2fs jq"; size=2048 ;;
+                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
               kali|mint)
-                pkgs="fuse2fs jq"; size=3072 ;;
+                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
               alpine)
                 # fuse2fs became its own package in 3.22.
                 if [[ "$release" == "3.21" ]]; then
@@ -87,21 +96,25 @@ jobs:
                 else
                   pkgs="fuse2fs jq"
                 fi
-                size=512 ;;
-              almalinux|rockylinux|centos|oracle|fedora|openeuler)
-                pkgs="fuse2fs jq"; size=3072 ;;
+                size=512; fuse=true ;;
+              almalinux|rockylinux|centos|oracle|openeuler)
+                # No standalone fuse2fs package; newer e2fsprogs may or
+                # may not bundle the binary depending on the EL release.
+                pkgs="e2fsprogs jq"; size=3072; fuse=false ;;
+              fedora)
+                pkgs="e2fsprogs jq"; size=3072; fuse=true ;;
               opensuse)
-                pkgs="fuse2fs jq"; size=3072 ;;
+                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
               archlinux)
                 # Arch does not split fuse2fs out of e2fsprogs.
-                pkgs="e2fsprogs jq"; size=2048 ;;
+                pkgs="e2fsprogs jq"; size=2048; fuse=true ;;
               *)
                 echo "SKIP $alias: no package rule for distro '$os'" >&2
                 continue ;;
             esac
             release_slug=$(tr '[:upper:]' '[:lower:]' <<<"$release")
             add "${os}-${release_slug}-cloud-incus" "images:$alias" \
-              "$pkgs" "$size"
+              "$pkgs" "$size" "$fuse"
           done < aliases.txt
 
           total=$(jq length <<<"$matrix")
@@ -170,8 +183,13 @@ jobs:
           set -eux
           tar -tzf "dist/${{ matrix.name }}.tar.gz" | \
             grep -E '^(metadata.yaml|templates/|rootfs/sbin/init)' >/dev/null
-          jq -e '.data_volume_fuse == true' \
-            "dist/${{ matrix.name }}.manifest.json"
+          if [[ '${{ matrix.fuse_required }}' == 'true' ]]; then
+            jq -e '.data_volume_fuse == true' \
+              "dist/${{ matrix.name }}.manifest.json"
+          else
+            echo "data_volume_fuse=$(jq -r '.data_volume_fuse' \
+              "dist/${{ matrix.name }}.manifest.json") (not required)"
+          fi
           jq . "dist/${{ matrix.name }}.manifest.json"
 
       - name: Compress BFV image

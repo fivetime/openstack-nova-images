@@ -123,6 +123,14 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
             chroot "$rootfs" dnf install -y \
                 --setopt=install_weak_deps=False "${packages[@]}"
         fi
+        # Depending on the release, fuse2fs ships inside e2fsprogs, as
+        # its own package, or not at all. Try the standalone name
+        # best-effort; the capability detection below records the truth.
+        if [[ ! -x "$rootfs/usr/sbin/fuse2fs" &&
+              ! -x "$rootfs/usr/bin/fuse2fs" ]]; then
+            chroot "$rootfs" dnf install -y \
+                --setopt=install_weak_deps=False fuse2fs || true
+        fi
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             chroot "$rootfs" systemctl enable sshd
         fi
