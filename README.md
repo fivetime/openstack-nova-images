@@ -101,7 +101,7 @@ GitHub 托管 runner **无法访问私网 OpenStack 端点**，因此推送是�
 ```bash
 gh release download <tag> --dir dist --repo fivetime/openstack-nova-images
 source /etc/openstack/admin-openrc
-IMAGE_STORE=rbd bash scripts/push-to-glance.sh dist
+IMAGE_STORE=rbd bash incus/push-to-glance.sh dist
 ```
 
 **方式二：自建 runner 自动推送**：注册一台能访问

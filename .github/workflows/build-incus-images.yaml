@@ -209,8 +209,10 @@ jobs:
       - name: Validate artifacts
         run: |
           set -eux
-          tar -tzf "dist/${{ matrix.name }}.tar.gz" | \
-            grep -E '^(metadata.yaml|templates/|rootfs/sbin/init)' >/dev/null
+          tar -tzf "dist/${{ matrix.name }}.tar.gz" > artifact-contents.txt
+          grep -Fx 'metadata.yaml' artifact-contents.txt
+          grep -E '^templates/' artifact-contents.txt >/dev/null
+          grep -E '^rootfs/' artifact-contents.txt >/dev/null
           if [[ '${{ matrix.fuse_required }}' == 'true' ]]; then
             jq -e '.data_volume_fuse == true' \
               "dist/${{ matrix.name }}.manifest.json"
