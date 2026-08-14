@@ -30,7 +30,10 @@ NAME_SUFFIX=${NAME_SUFFIX:-}
 
 command -v openstack >/dev/null
 command -v jq >/dev/null
-[[ -n "${OS_AUTH_URL:-}" ]] || { echo "OS_AUTH_URL is not set" >&2; exit 1; }
+[[ -n "${OS_CLOUD:-}" || -n "${OS_AUTH_URL:-}" ]] || {
+    echo "Set OS_CLOUD or OS_AUTH_URL for OpenStack authentication" >&2
+    exit 1
+}
 if [[ -n "$IMAGE_STORE" ]]; then
     [[ "$IMAGE_STORE" =~ ^[A-Za-z0-9._-]+$ ]] || {
         echo "IMAGE_STORE contains unsupported characters" >&2
