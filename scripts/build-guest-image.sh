@@ -79,8 +79,8 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
 
     packages=($PREINSTALL_PACKAGES)
     if [[ -x "$rootfs/sbin/apk" || -x "$rootfs/usr/bin/apk" ]]; then
-        # Alpine bases. Package names differ from Debian: fuse2fs ships in
-        # e2fsprogs-extra.
+        # Alpine bases. Package names differ from Debian: fuse2fs is its
+        # own package on 3.22+, part of e2fsprogs-extra on older releases.
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             packages+=(openssh)
         fi

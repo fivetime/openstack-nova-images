@@ -77,7 +77,7 @@ Add a matrix entry in `.github/workflows/build.yaml`:
 ```yaml
 - name: debian-trixie-cloud-incus
   source: images:debian/trixie/cloud
-  packages: fuse2fs jq        # e2fsprogs-extra on Alpine
+  packages: fuse2fs jq        # e2fsprogs-extra on Alpine <=3.21
   bfv_size_mib: 2048
 ```
 

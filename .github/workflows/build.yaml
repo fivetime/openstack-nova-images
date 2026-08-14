@@ -44,7 +44,9 @@ jobs:
             bfv_size_mib: 2048
           - name: alpine-3.22-cloud-incus
             source: images:alpine/3.22/cloud
-            packages: e2fsprogs-extra jq
+            # Alpine 3.22 ships fuse2fs as its own package; on <=3.21 it
+            # lived inside e2fsprogs-extra.
+            packages: fuse2fs jq
             bfv_size_mib: 512
     steps:
       - name: Check out repo
