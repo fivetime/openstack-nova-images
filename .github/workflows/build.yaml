@@ -55,7 +55,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             incus squashfs-tools zstd jq file
-          sudo incus admin init --auto
+          # No network: the build only copies/exports images, never starts
+          # a container, and the runner lacks dnsmasq for a bridge.
+          sudo incus admin init --preseed <<'EOF'
+          networks: []
+          storage_pools:
+          - name: default
+            driver: dir
+          profiles:
+          - name: default
+            devices:
+              root:
+                path: /
+                pool: default
+          EOF
 
       - name: Build unified guest image
         run: |
