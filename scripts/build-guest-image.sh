@@ -154,10 +154,13 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         chroot "$rootfs" zypper --non-interactive clean --all
         rm -f "$rootfs/etc/resolv.conf"
     elif [[ -x "$rootfs/usr/bin/pacman" ]]; then
-        # Arch: the upstream cloud image ships an initialized keyring.
+        # Arch: the upstream image ships the archlinux-keyring package
+        # but not an initialized pacman keyring; populate is offline.
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             packages+=(openssh)
         fi
+        chroot "$rootfs" pacman-key --init
+        chroot "$rootfs" pacman-key --populate archlinux
         # pacman's CheckSpace cannot resolve the cache dir mount point
         # from inside a plain chroot and aborts with a bogus disk-full
         # error; disable it for the install only.
@@ -177,6 +180,8 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             chroot "$rootfs" systemctl enable sshd
         fi
+        # pacman-key leaves gpg-agent processes anchored in the chroot.
+        chroot "$rootfs" gpgconf --kill all || true
         rm -rf "$rootfs/var/cache/pacman/pkg"/*
         rm -f "$rootfs/etc/resolv.conf"
     else
