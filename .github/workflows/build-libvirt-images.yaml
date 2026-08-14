@@ -142,8 +142,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            incus qemu-utils libguestfs-tools jq file
-          sudo chmod a+rw /dev/kvm || true
+            incus qemu-utils jq file
           sudo incus admin init --preseed <<'EOF'
           networks: []
           storage_pools:
