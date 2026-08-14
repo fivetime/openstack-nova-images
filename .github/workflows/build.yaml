@@ -1,0 +1,176 @@
+name: Build guest images
+
+# Builds nova-incus guest images from the newest upstream builds on
+# images.linuxcontainers.org (the "images:" remote always resolves an
+# alias to its latest build; the exact fingerprint/serial is recorded in
+# each manifest). Artifacts follow the openstack-incus image contract:
+#
+#   <name>.tar.gz        unified Incus tar (metadata.yaml/templates/rootfs)
+#   <name>-bfv.raw.zst   ext4 BFV root (top-level rootfs/ + .incus-idmap)
+#   <name>.manifest.json provenance + capability flags
+#
+# Every run publishes a GitHub release. Pushing to Glance is a separate,
+# opt-in job because GitHub-hosted runners cannot reach a private
+# OpenStack endpoint; see README for the self-hosted/manual options.
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      push_to_glance:
+        description: 'Push to Glance (needs OS_* secrets + reachable endpoint)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-guest-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-noble-24.04-cloud-incus
+            source: images:ubuntu/noble/cloud
+            packages: fuse2fs jq
+            bfv_size_mib: 2048
+          - name: alpine-3.22-cloud-incus
+            source: images:alpine/3.22/cloud
+            packages: e2fsprogs-extra jq
+            bfv_size_mib: 512
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install Incus and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            incus squashfs-tools zstd jq file
+          sudo incus admin init --auto
+
+      - name: Build unified guest image
+        run: |
+          sudo env \
+            SOURCE='${{ matrix.source }}' \
+            IMAGE_NAME='${{ matrix.name }}' \
+            PREINSTALL_SSH=true \
+            PREINSTALL_PACKAGES='${{ matrix.packages }}' \
+            OUTPUT_DIR="$PWD/dist" \
+            bash scripts/build-guest-image.sh
+
+      - name: Build BFV raw image
+        run: |
+          sudo env \
+            IMAGE_NAME='${{ matrix.name }}' \
+            IMAGE_SIZE_MIB='${{ matrix.bfv_size_mib }}' \
+            OUTPUT_DIR="$PWD/dist" \
+            bash scripts/build-bfv-image.sh
+
+      - name: Validate artifacts
+        run: |
+          set -eux
+          tar -tzf "dist/${{ matrix.name }}.tar.gz" | \
+            grep -E '^(metadata.yaml|templates/|rootfs/sbin/init)' >/dev/null
+          jq -e '.data_volume_fuse == true' \
+            "dist/${{ matrix.name }}.manifest.json"
+          jq . "dist/${{ matrix.name }}.manifest.json"
+
+      - name: Compress BFV image
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          zstd -12 -T0 --rm "dist/${{ matrix.name }}-bfv.raw"
+          jq --arg bfv "${{ matrix.name }}-bfv.raw.zst" \
+            '.bfv_raw = $bfv' "dist/${{ matrix.name }}.manifest.json" \
+            > manifest.tmp
+          mv manifest.tmp "dist/${{ matrix.name }}.manifest.json"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          tag="guest-images-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          {
+            echo "| Image | Source | Serial | fuse2fs |"
+            echo "|---|---|---|---|"
+            for m in *.manifest.json; do
+              jq -r '"| \(.name) | \(.source_alias) | \(.source_serial) | \(.data_volume_fuse) |"' "$m"
+            done
+            echo
+            echo "Push to Glance with \`scripts/push-to-glance.sh\` after"
+            echo "downloading these files; see README."
+          } > notes.md
+          gh release create "$tag" \
+            --title "Guest images $tag" \
+            --notes-file notes.md \
+            -- *.tar.gz *.raw.zst *.manifest.json SHA256SUMS
+
+  push-to-glance:
+    # Off by default: GitHub-hosted runners cannot reach a private
+    # OpenStack endpoint. Enable by setting the PUSH_TO_GLANCE repo
+    # variable to 'true' (with GLANCE_RUNNER pointing at a self-hosted
+    # runner label that can reach Keystone/Glance), or per-run via the
+    # workflow_dispatch input.
+    if: >-
+      vars.PUSH_TO_GLANCE == 'true' ||
+      (github.event_name == 'workflow_dispatch' && inputs.push_to_glance)
+    needs: build
+    runs-on: ${{ vars.GLANCE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+      OS_PROJECT_NAME: ${{ secrets.OS_PROJECT_NAME }}
+      OS_PROJECT_DOMAIN_NAME: ${{ secrets.OS_PROJECT_DOMAIN_NAME }}
+      OS_USERNAME: ${{ secrets.OS_USERNAME }}
+      OS_USER_DOMAIN_NAME: ${{ secrets.OS_USER_DOMAIN_NAME }}
+      OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+      OS_REGION_NAME: ${{ secrets.OS_REGION_NAME }}
+      OS_IDENTITY_API_VERSION: '3'
+      IMAGE_STORE: ${{ vars.GLANCE_IMAGE_STORE }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install OpenStack CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install python-openstackclient
+          sudo apt-get install -y --no-install-recommends zstd jq || true
+
+      - name: Push images to Glance
+        run: bash scripts/push-to-glance.sh dist

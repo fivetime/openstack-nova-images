@@ -1,0 +1,4 @@
+dist/
+*.raw
+*.raw.zst
+*.tar.gz
