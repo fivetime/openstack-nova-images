@@ -1,0 +1,343 @@
+name: Build incus images
+
+# Builds nova-incus guest images for EVERY image the upstream server
+# publishes that meets the driver's criteria: variant=cloud (cloud-init),
+# Incus container support, x86_64. The list is discovered at run time
+# from the images: remote (the same simplestreams catalog the incus
+# client consumes), so new upstream releases join the matrix
+# automatically and retired ones drop out. Distributions without a
+# package rule are skipped with a log line, never silently.
+#
+# Artifacts follow the openstack-incus image contract:
+#
+#   <name>.tar.gz        unified Incus tar (metadata.yaml/templates/rootfs)
+#   <name>-bfv.raw.zst   ext4 BFV root (top-level rootfs/ + .incus-idmap)
+#   <name>.manifest.json provenance + capability flags
+#
+# Every run publishes a GitHub release. Pushing to Glance is a separate,
+# opt-in job because GitHub-hosted runners cannot reach a private
+# OpenStack endpoint; see README for the self-hosted/manual options.
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      push_to_glance:
+        description: 'Push to Glance (needs OS_* secrets + reachable endpoint)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-incus-guest-images
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - name: Install Incus and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends incus jq
+          sudo incus admin init --preseed <<'EOF'
+          networks: []
+          storage_pools: []
+          EOF
+
+      - name: Generate image matrix from the images remote
+        id: gen
+        # Explicit bash shell: the default runner shell lacks pipefail,
+        # which once let a mid-stream jq failure truncate this list to a
+        # single alias while the step still reported success.
+        shell: bash
+        run: |
+          sudo incus image list images: --format json > catalog.json
+
+          # One alias per image: the catalog lists the same image under a
+          # numeric and a codename alias (debian/12 + debian/bookworm);
+          # prefer the codename so each image builds exactly once.
+          jq -r '.[]
+              | select(.type == "container" and .architecture == "x86_64")
+              | ((.aliases // []) | map(.name)
+                 | map(select(test("^[a-z0-9]+/[^/]+/cloud$")))) as $names
+              | select(($names | length) > 0)
+              | ($names
+                 | map(select(test("^[a-z0-9]+/[0-9.]+/cloud$") | not)))
+                as $codenames
+              | if ($codenames | length) > 0
+                then $codenames[0] else $names[0] end' catalog.json \
+            | sort -u > aliases.txt
+
+          matrix='[]'
+          add() {
+            matrix=$(jq --arg n "$1" --arg s "$2" --arg p "$3" \
+              --argjson b "$4" --argjson f "$5" \
+              '. + [{name:$n, source:$s, packages:$p, bfv_size_mib:$b,
+                     fuse_required:$f}]' \
+              <<<"$matrix")
+          }
+
+          # fuse=true families MUST end up with an executable fuse2fs
+          # (build fails otherwise). fuse=false families publish with the
+          # data-volume capability narrowed when the distro cannot
+          # provide fuse2fs — visible in the manifest, never silent.
+          while read -r alias; do
+            os=${alias%%/*}
+            rest=${alias#*/}
+            release=${rest%%/*}
+            case "$os" in
+              ubuntu|debian|devuan)
+                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
+              kali|mint)
+                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
+              alpine)
+                # fuse2fs is a standalone package on every supported
+                # release (3.21+); it was never inside e2fsprogs-extra.
+                pkgs="fuse2fs jq"; size=512; fuse=true ;;
+              almalinux|rockylinux|centos|oracle|openeuler)
+                # No standalone fuse2fs package; newer e2fsprogs may or
+                # may not bundle the binary depending on the EL release.
+                pkgs="e2fsprogs jq"; size=3072; fuse=false ;;
+              fedora)
+                pkgs="e2fsprogs jq"; size=3072; fuse=true ;;
+              opensuse)
+                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
+              archlinux)
+                # fuse2fs split out of e2fsprogs into its own core
+                # package in 2026.
+                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
+              *)
+                echo "SKIP $alias: no package rule for distro '$os'" >&2
+                continue ;;
+            esac
+            release_slug=$(tr '[:upper:]' '[:lower:]' <<<"$release")
+            add "${os}-${release_slug}-cloud-incus" "images:$alias" \
+              "$pkgs" "$size" "$fuse"
+          done < aliases.txt
+
+          total=$(jq length <<<"$matrix")
+          ((total > 0)) || { echo "empty matrix" >&2; exit 1; }
+          {
+            echo "## Discovered $total buildable images"
+            jq -r '.[] | "- \(.source) -> \(.name) [\(.packages)]"' \
+              <<<"$matrix"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "matrix=$(jq -c . <<<"$matrix")" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+  prepare:
+    # Create the draft release up front so each build job can upload its
+    # own artifacts directly: aggregating ~50 image pairs on a single
+    # runner exceeds its disk.
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Create draft release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="incus-images-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          gh release create "$tag" --draft \
+            --title "Guest images $tag" \
+            --notes "Build in progress."
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [discover, prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install Incus and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            incus squashfs-tools zstd jq file
+          # No network: the build only copies/exports images, never starts
+          # a container, and the runner lacks dnsmasq for a bridge.
+          sudo incus admin init --preseed <<'EOF'
+          networks: []
+          storage_pools:
+          - name: default
+            driver: dir
+          profiles:
+          - name: default
+            devices:
+              root:
+                type: disk
+                path: /
+                pool: default
+          EOF
+
+      - name: Build unified guest image
+        run: |
+          sudo env \
+            SOURCE='${{ matrix.source }}' \
+            IMAGE_NAME='${{ matrix.name }}' \
+            PREINSTALL_SSH=true \
+            PREINSTALL_PACKAGES='${{ matrix.packages }}' \
+            OUTPUT_DIR="$PWD/dist" \
+            bash incus/build-guest-image.sh
+
+      - name: Build BFV raw image
+        run: |
+          sudo env \
+            IMAGE_NAME='${{ matrix.name }}' \
+            IMAGE_SIZE_MIB='${{ matrix.bfv_size_mib }}' \
+            OUTPUT_DIR="$PWD/dist" \
+            bash incus/build-bfv-image.sh
+
+      - name: Validate artifacts
+        run: |
+          set -eux
+          tar -tzf "dist/${{ matrix.name }}.tar.gz" | \
+            grep -E '^(metadata.yaml|templates/|rootfs/sbin/init)' >/dev/null
+          if [[ '${{ matrix.fuse_required }}' == 'true' ]]; then
+            jq -e '.data_volume_fuse == true' \
+              "dist/${{ matrix.name }}.manifest.json"
+          else
+            echo "data_volume_fuse=$(jq -r '.data_volume_fuse' \
+              "dist/${{ matrix.name }}.manifest.json") (not required)"
+          fi
+          jq . "dist/${{ matrix.name }}.manifest.json"
+
+      - name: Compress BFV image
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          zstd -12 -T0 --rm "dist/${{ matrix.name }}-bfv.raw"
+          jq --arg bfv "${{ matrix.name }}-bfv.raw.zst" \
+            '.bfv_raw = $bfv' "dist/${{ matrix.name }}.manifest.json" \
+            > manifest.tmp
+          mv manifest.tmp "dist/${{ matrix.name }}.manifest.json"
+          cd dist
+          sha256sum "${{ matrix.name }}.tar.gz" \
+            "${{ matrix.name }}-bfv.raw.zst" > "${{ matrix.name }}.sha256"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload '${{ needs.prepare.outputs.tag }}' \
+            "dist/${{ matrix.name }}.tar.gz" \
+            "dist/${{ matrix.name }}-bfv.raw.zst" \
+            "dist/${{ matrix.name }}.manifest.json"
+
+      - name: Upload metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-${{ matrix.name }}
+          path: |
+            dist/*.manifest.json
+            dist/*.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  finalize-release:
+    # Publish whatever subset built successfully; individual distro
+    # failures must not block the rest of the fleet. Only the tiny
+    # manifest/checksum artifacts are aggregated here — the image
+    # payloads were uploaded straight to the release by each build job.
+    needs: [discover, prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download metadata artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: meta-*
+          path: dist
+          merge-multiple: true
+
+      - name: Finalize release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TOTAL: ${{ needs.discover.outputs.total }}
+        run: |
+          cd dist
+          built=$(ls -- *.manifest.json | wc -l)
+          cat -- *.sha256 | sort -k2 > SHA256SUMS
+          {
+            echo "Built $built of $TOTAL discovered images."
+            echo
+            echo "| Image | Source | Serial | fuse2fs |"
+            echo "|---|---|---|---|"
+            for m in *.manifest.json; do
+              jq -r '"| \(.name) | \(.source_alias) | \(.source_serial) | \(.data_volume_fuse) |"' "$m"
+            done
+            echo
+            echo "Push to Glance with \`incus/push-to-glance.sh\` after"
+            echo "downloading these files; see README."
+          } > notes.md
+          gh release upload "$TAG" SHA256SUMS
+          gh release edit "$TAG" --draft=false --notes-file notes.md
+
+  push-to-glance:
+    # Off by default: GitHub-hosted runners cannot reach a private
+    # OpenStack endpoint. Enable by setting the PUSH_TO_GLANCE repo
+    # variable to 'true' (with GLANCE_RUNNER pointing at a self-hosted
+    # runner label that can reach Keystone/Glance), or per-run via the
+    # workflow_dispatch input.
+    if: >-
+      ${{ !cancelled() &&
+          (vars.PUSH_TO_GLANCE == 'true' ||
+           (github.event_name == 'workflow_dispatch' &&
+            inputs.push_to_glance)) }}
+    needs: [discover, prepare, build]
+    runs-on: ${{ vars.GLANCE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    env:
+      OS_AUTH_URL: ${{ secrets.OS_AUTH_URL }}
+      OS_PROJECT_NAME: ${{ secrets.OS_PROJECT_NAME }}
+      OS_PROJECT_DOMAIN_NAME: ${{ secrets.OS_PROJECT_DOMAIN_NAME }}
+      OS_USERNAME: ${{ secrets.OS_USERNAME }}
+      OS_USER_DOMAIN_NAME: ${{ secrets.OS_USER_DOMAIN_NAME }}
+      OS_PASSWORD: ${{ secrets.OS_PASSWORD }}
+      OS_REGION_NAME: ${{ secrets.OS_REGION_NAME }}
+      OS_IDENTITY_API_VERSION: '3'
+      IMAGE_STORE: ${{ vars.GLANCE_IMAGE_STORE }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # The full asset set is tens of GB; run this on a self-hosted
+        # runner with enough disk (it is the only kind that can reach a
+        # private OpenStack endpoint anyway).
+        run: |
+          gh release download '${{ needs.prepare.outputs.tag }}' \
+            --dir dist
+
+      - name: Install OpenStack CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install python-openstackclient
+          sudo apt-get install -y --no-install-recommends zstd jq || true
+
+      - name: Push images to Glance
+        run: bash incus/push-to-glance.sh dist

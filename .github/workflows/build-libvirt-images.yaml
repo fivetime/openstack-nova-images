@@ -1,26 +1,25 @@
-name: Build guest images
+name: Build libvirt images
 
-# Builds nova-incus guest images for EVERY image the upstream server
-# publishes that meets the driver's criteria: variant=cloud (cloud-init),
-# Incus container support, x86_64. The list is discovered at run time
-# from the images: remote (the same simplestreams catalog the incus
-# client consumes), so new upstream releases join the matrix
-# automatically and retired ones drop out. Distributions without a
-# package rule are skipped with a log line, never silently.
+# Builds libvirt/KVM guest disks for EVERY virtual-machine image the
+# upstream server publishes that qualifies: variant=cloud (cloud-init),
+# Incus VM disk available, x86_64. Discovery works exactly like the
+# Incus container pipeline — the images: remote catalog is queried at
+# run time, so upstream additions and removals track automatically.
 #
-# Artifacts follow the openstack-incus image contract:
+# Each disk gets qemu-guest-agent installed and enabled, which is the
+# channel Nova's libvirt driver uses for the admin-password API
+# (openstack server set --password); the push script advertises it with
+# hw_qemu_guest_agent=yes. The upstream disks boot UEFI, advertised
+# with hw_firmware_type=uefi.
 #
-#   <name>.tar.gz        unified Incus tar (metadata.yaml/templates/rootfs)
-#   <name>-bfv.raw.zst   ext4 BFV root (top-level rootfs/ + .incus-idmap)
-#   <name>.manifest.json provenance + capability flags
-#
-# Every run publishes a GitHub release. Pushing to Glance is a separate,
-# opt-in job because GitHub-hosted runners cannot reach a private
-# OpenStack endpoint; see README for the self-hosted/manual options.
+# Artifacts per image: <name>.qcow2 + <name>.manifest.json. Every run
+# publishes a GitHub release (assets uploaded by each build job — the
+# full set exceeds a single runner's disk). Pushing to Glance is a
+# separate opt-in job; see README.
 
 on:
   schedule:
-    - cron: '0 0 1 * *'
+    - cron: '0 2 1 * *'
   workflow_dispatch:
     inputs:
       push_to_glance:
@@ -32,7 +31,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-guest-images
+  group: build-libvirt-guest-images
   cancel-in-progress: false
 
 jobs:
@@ -54,18 +53,17 @@ jobs:
 
       - name: Generate image matrix from the images remote
         id: gen
-        # Explicit bash shell: the default runner shell lacks pipefail,
-        # which once let a mid-stream jq failure truncate this list to a
-        # single alias while the step still reported success.
+        # Explicit bash shell for pipefail: the default runner shell
+        # swallows mid-pipeline jq failures.
         shell: bash
         run: |
           sudo incus image list images: --format json > catalog.json
 
-          # One alias per image: the catalog lists the same image under a
-          # numeric and a codename alias (debian/12 + debian/bookworm);
-          # prefer the codename so each image builds exactly once.
+          # One alias per image: prefer the codename alias over the
+          # numeric alias of the same disk.
           jq -r '.[]
-              | select(.type == "container" and .architecture == "x86_64")
+              | select(.type == "virtual-machine"
+                       and .architecture == "x86_64")
               | ((.aliases // []) | map(.name)
                  | map(select(test("^[a-z0-9]+/[^/]+/cloud$")))) as $names
               | select(($names | length) > 0)
@@ -79,64 +77,37 @@ jobs:
           matrix='[]'
           add() {
             matrix=$(jq --arg n "$1" --arg s "$2" --arg p "$3" \
-              --argjson b "$4" --argjson f "$5" \
-              '. + [{name:$n, source:$s, packages:$p, bfv_size_mib:$b,
-                     fuse_required:$f}]' \
-              <<<"$matrix")
+              '. + [{name:$n, source:$s, pre_command:$p}]' <<<"$matrix")
           }
 
-          # fuse=true families MUST end up with an executable fuse2fs
-          # (build fails otherwise). fuse=false families publish with the
-          # data-volume capability narrowed when the distro cannot
-          # provide fuse2fs — visible in the manifest, never silent.
           while read -r alias; do
             os=${alias%%/*}
             rest=${alias#*/}
             release=${rest%%/*}
             case "$os" in
-              ubuntu|debian|devuan)
-                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
-              kali|mint)
-                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
-              alpine)
-                # fuse2fs is a standalone package on every supported
-                # release (3.21+); it was never inside e2fsprogs-extra.
-                pkgs="fuse2fs jq"; size=512; fuse=true ;;
-              almalinux|rockylinux|centos|oracle|openeuler)
-                # No standalone fuse2fs package; newer e2fsprogs may or
-                # may not bundle the binary depending on the EL release.
-                pkgs="e2fsprogs jq"; size=3072; fuse=false ;;
-              fedora)
-                pkgs="e2fsprogs jq"; size=3072; fuse=true ;;
-              opensuse)
-                pkgs="fuse2fs jq"; size=3072; fuse=true ;;
+              ubuntu|debian|almalinux|rockylinux|centos|fedora|openeuler|opensuse|alpine)
+                pre="" ;;
               archlinux)
-                # fuse2fs split out of e2fsprogs into its own core
-                # package in 2026.
-                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
+                # pacman refuses to install until the keyring exists.
+                pre="pacman-key --init && pacman-key --populate archlinux" ;;
               *)
-                echo "SKIP $alias: no package rule for distro '$os'" >&2
+                echo "SKIP $alias: no rule for distro '$os'" >&2
                 continue ;;
             esac
             release_slug=$(tr '[:upper:]' '[:lower:]' <<<"$release")
-            add "${os}-${release_slug}-cloud-incus" "images:$alias" \
-              "$pkgs" "$size" "$fuse"
+            add "${os}-${release_slug}-cloud-kvm" "images:$alias" "$pre"
           done < aliases.txt
 
           total=$(jq length <<<"$matrix")
           ((total > 0)) || { echo "empty matrix" >&2; exit 1; }
           {
-            echo "## Discovered $total buildable images"
-            jq -r '.[] | "- \(.source) -> \(.name) [\(.packages)]"' \
-              <<<"$matrix"
+            echo "## Discovered $total buildable VM images"
+            jq -r '.[] | "- \(.source) -> \(.name)"' <<<"$matrix"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "matrix=$(jq -c . <<<"$matrix")" >> "$GITHUB_OUTPUT"
           echo "total=$total" >> "$GITHUB_OUTPUT"
 
   prepare:
-    # Create the draft release up front so each build job can upload its
-    # own artifacts directly: aggregating ~50 image pairs on a single
-    # runner exceeds its disk.
     needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -149,9 +120,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="guest-images-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          tag="libvirt-images-$(date -u +%Y%m%d)-${{ github.run_number }}"
           gh release create "$tag" --draft \
-            --title "Guest images $tag" \
+            --title "libvirt guest images $tag" \
             --notes "Build in progress."
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -171,9 +142,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            incus squashfs-tools zstd jq file
-          # No network: the build only copies/exports images, never starts
-          # a container, and the runner lacks dnsmasq for a bridge.
+            incus qemu-utils libguestfs-tools jq file
+          sudo chmod a+rw /dev/kvm || true
           sudo incus admin init --preseed <<'EOF'
           networks: []
           storage_pools:
@@ -188,49 +158,28 @@ jobs:
                 pool: default
           EOF
 
-      - name: Build unified guest image
+      - name: Build VM image
         run: |
           sudo env \
             SOURCE='${{ matrix.source }}' \
             IMAGE_NAME='${{ matrix.name }}' \
-            PREINSTALL_SSH=true \
-            PREINSTALL_PACKAGES='${{ matrix.packages }}' \
+            PRE_COMMAND='${{ matrix.pre_command }}' \
             OUTPUT_DIR="$PWD/dist" \
-            bash scripts/build-guest-image.sh
-
-      - name: Build BFV raw image
-        run: |
-          sudo env \
-            IMAGE_NAME='${{ matrix.name }}' \
-            IMAGE_SIZE_MIB='${{ matrix.bfv_size_mib }}' \
-            OUTPUT_DIR="$PWD/dist" \
-            bash scripts/build-bfv-image.sh
+            bash libvirt/build-vm-image.sh
 
       - name: Validate artifacts
         run: |
           set -eux
-          tar -tzf "dist/${{ matrix.name }}.tar.gz" | \
-            grep -E '^(metadata.yaml|templates/|rootfs/sbin/init)' >/dev/null
-          if [[ '${{ matrix.fuse_required }}' == 'true' ]]; then
-            jq -e '.data_volume_fuse == true' \
-              "dist/${{ matrix.name }}.manifest.json"
-          else
-            echo "data_volume_fuse=$(jq -r '.data_volume_fuse' \
-              "dist/${{ matrix.name }}.manifest.json") (not required)"
-          fi
+          sudo chown -R "$(id -u):$(id -g)" dist
+          qemu-img check "dist/${{ matrix.name }}.qcow2"
+          jq -e '.qemu_guest_agent == true' \
+            "dist/${{ matrix.name }}.manifest.json"
           jq . "dist/${{ matrix.name }}.manifest.json"
 
-      - name: Compress BFV image
+      - name: Checksum
         run: |
-          sudo chown -R "$(id -u):$(id -g)" dist
-          zstd -12 -T0 --rm "dist/${{ matrix.name }}-bfv.raw"
-          jq --arg bfv "${{ matrix.name }}-bfv.raw.zst" \
-            '.bfv_raw = $bfv' "dist/${{ matrix.name }}.manifest.json" \
-            > manifest.tmp
-          mv manifest.tmp "dist/${{ matrix.name }}.manifest.json"
           cd dist
-          sha256sum "${{ matrix.name }}.tar.gz" \
-            "${{ matrix.name }}-bfv.raw.zst" > "${{ matrix.name }}.sha256"
+          sha256sum "${{ matrix.name }}.qcow2" > "${{ matrix.name }}.sha256"
 
       - name: Upload to release
         env:
@@ -238,14 +187,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release upload '${{ needs.prepare.outputs.tag }}' \
-            "dist/${{ matrix.name }}.tar.gz" \
-            "dist/${{ matrix.name }}-bfv.raw.zst" \
+            "dist/${{ matrix.name }}.qcow2" \
             "dist/${{ matrix.name }}.manifest.json"
 
       - name: Upload metadata artifact
         uses: actions/upload-artifact@v4
         with:
-          name: meta-${{ matrix.name }}
+          name: meta-libvirt-${{ matrix.name }}
           path: |
             dist/*.manifest.json
             dist/*.sha256
@@ -254,9 +202,7 @@ jobs:
 
   finalize-release:
     # Publish whatever subset built successfully; individual distro
-    # failures must not block the rest of the fleet. Only the tiny
-    # manifest/checksum artifacts are aggregated here — the image
-    # payloads were uploaded straight to the release by each build job.
+    # failures must not block the rest of the fleet.
     needs: [discover, prepare, build]
     if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
@@ -265,7 +211,7 @@ jobs:
       - name: Download metadata artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: meta-*
+          pattern: meta-libvirt-*
           path: dist
           merge-multiple: true
 
@@ -280,26 +226,24 @@ jobs:
           built=$(ls -- *.manifest.json | wc -l)
           cat -- *.sha256 | sort -k2 > SHA256SUMS
           {
-            echo "Built $built of $TOTAL discovered images."
+            echo "Built $built of $TOTAL discovered VM images."
             echo
-            echo "| Image | Source | Serial | fuse2fs |"
+            echo "| Image | Source | Serial | qemu-guest-agent |"
             echo "|---|---|---|---|"
             for m in *.manifest.json; do
-              jq -r '"| \(.name) | \(.source_alias) | \(.source_serial) | \(.data_volume_fuse) |"' "$m"
+              jq -r '"| \(.name) | \(.source_alias) | \(.source_serial) | \(.qemu_guest_agent) |"' "$m"
             done
             echo
-            echo "Push to Glance with \`scripts/push-to-glance.sh\` after"
-            echo "downloading these files; see README."
+            echo "Push to Glance with \`libvirt/push-to-glance.sh\`;"
+            echo "see README."
           } > notes.md
           gh release upload "$TAG" SHA256SUMS
           gh release edit "$TAG" --draft=false --notes-file notes.md
 
   push-to-glance:
     # Off by default: GitHub-hosted runners cannot reach a private
-    # OpenStack endpoint. Enable by setting the PUSH_TO_GLANCE repo
-    # variable to 'true' (with GLANCE_RUNNER pointing at a self-hosted
-    # runner label that can reach Keystone/Glance), or per-run via the
-    # workflow_dispatch input.
+    # OpenStack endpoint. Enable via the PUSH_TO_GLANCE repo variable
+    # plus GLANCE_RUNNER, or per-run via the workflow_dispatch input.
     if: >-
       ${{ !cancelled() &&
           (vars.PUSH_TO_GLANCE == 'true' ||
@@ -326,9 +270,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        # The full asset set is tens of GB; run this on a self-hosted
-        # runner with enough disk (it is the only kind that can reach a
-        # private OpenStack endpoint anyway).
         run: |
           gh release download '${{ needs.prepare.outputs.tag }}' \
             --dir dist
@@ -337,7 +278,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install python-openstackclient
-          sudo apt-get install -y --no-install-recommends zstd jq || true
+          sudo apt-get install -y --no-install-recommends jq || true
 
       - name: Push images to Glance
-        run: bash scripts/push-to-glance.sh dist
+        run: bash libvirt/push-to-glance.sh dist

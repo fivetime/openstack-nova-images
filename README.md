@@ -71,8 +71,15 @@ Glance 不打对应属性，驱动会拒绝为其挂初始数据卷——能力�
 
 ## 工作流
 
-`.github/workflows/build.yaml`，每月 1 号 00:00 UTC 自动运行，也可
-手动触发。job 编排：
+两条独立流水线，发现机制相同（同一个 `images:` remote 目录），产物
+和定制各自对应一种计算驱动：
+
+| 工作流 | 上游筛选 | 产物 | Release 标签 |
+|---|---|---|---|
+| `build-incus-images.yaml`（每月 1 号 00:00 UTC） | `type=container` | unified tar + BFV raw | `incus-images-*` |
+| `build-libvirt-images.yaml`（每月 1 号 02:00 UTC） | `type=virtual-machine` | qcow2 | `libvirt-images-*` |
+
+job 编排（两条流水线相同）：
 
 ```
 discover ─→ prepare（建 draft release）─→ build ×41（各自上传产物）
@@ -121,9 +128,33 @@ Keystone/Glance 的 runner，设置仓库变量 `GLANCE_RUNNER`（runner
 
 | 脚本 | 职责 |
 |---|---|
-| `scripts/build-guest-image.sh` | 从 `images:` remote 复制最新构建，chroot 装包（apk/apt/dnf/zypper/pacman 五分支），重打 unified tar，写 manifest |
-| `scripts/build-bfv-image.sh` | unified tar → ext4 raw（`rootfs/` 布局 + `.incus-idmap`），校验余量与 `e2fsck` |
-| `scripts/push-to-glance.sh` | 按 manifest 把两种制品带属性推入 Glance，支持多 store 的 copy-image 导入 |
+| `incus/build-guest-image.sh` | 从 `images:` remote 复制最新容器构建，chroot 装包（apk/apt/dnf/zypper/pacman 五分支），重打 unified tar，写 manifest |
+| `incus/build-bfv-image.sh` | unified tar → ext4 raw（`rootfs/` 布局 + `.incus-idmap`），校验余量与 `e2fsck` |
+| `incus/push-to-glance.sh` | 按 manifest 把两种制品带属性推入 Glance，支持多 store 的 copy-image 导入 |
+| `libvirt/build-vm-image.sh` | 复制最新 VM 构建（`--vm`），virt-customize 预置 qemu-guest-agent，重压缩 qcow2，写 manifest |
+| `libvirt/push-to-glance.sh` | qcow2 带 KVM 属性集推入 Glance，同样支持多 store |
+
+## libvirt/KVM 镜像流水线
+
+与 incus 流水线共享同一个上游目录，筛选 `type=virtual-machine` +
+`variant=cloud` + `x86_64`（约 27 个：ubuntu/debian/alpine/EL 系/
+fedora/opensuse/arch；freebsd 的 variant 是 `cloud+ufs/zfs`，被
+筛选正则天然排除，libguestfs 也无法处理 ZFS 盘）。
+
+定制内容只有一件事：**virt-customize 安装并启用
+qemu-guest-agent**——这是 Nova libvirt 驱动实现
+`openstack server set --password`（管理员改密码 API）的通道。构建
+后实测盘内 `qemu-ga` 二进制存在才算数（`qemu_guest_agent` 硬校验，
+与 incus 侧的 fuse2fs 校验同一哲学）。
+
+`libvirt/push-to-glance.sh` 自动打的属性：
+
+* `hypervisor_type=qemu`——与 incus 侧的 `lxd` 对偶，混合集群里
+  `ImagePropertiesFilter` 按此分流调度（`HYPERVISOR_TYPE=` 可覆盖）；
+* `hw_qemu_guest_agent=yes`——Nova 见此属性才为虚机接 virtio 通道，
+  改密码 API 才可用；
+* `hw_firmware_type=uefi`——上游 distrobuilder 的 VM 盘是 UEFI
+  启动（`FIRMWARE_TYPE=` 置空可省略）。
 
 ## 发布 ≠ 资格
 
