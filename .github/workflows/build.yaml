@@ -111,8 +111,9 @@ jobs:
               opensuse)
                 pkgs="fuse2fs jq"; size=3072; fuse=true ;;
               archlinux)
-                # Arch does not split fuse2fs out of e2fsprogs.
-                pkgs="e2fsprogs jq"; size=2048; fuse=true ;;
+                # fuse2fs split out of e2fsprogs into its own core
+                # package in 2026.
+                pkgs="fuse2fs jq"; size=2048; fuse=true ;;
               *)
                 echo "SKIP $alias: no package rule for distro '$os'" >&2
                 continue ;;
