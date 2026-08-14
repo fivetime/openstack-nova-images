@@ -79,8 +79,8 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
 
     packages=($PREINSTALL_PACKAGES)
     if [[ -x "$rootfs/sbin/apk" || -x "$rootfs/usr/bin/apk" ]]; then
-        # Alpine bases. Package names differ from Debian: fuse2fs is its
-        # own package on 3.22+, part of e2fsprogs-extra on older releases.
+        # Alpine bases. fuse2fs has been a standalone package on every
+        # supported release (3.21+).
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             packages+=(openssh)
         fi
@@ -103,13 +103,16 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
                 apt-get -o Acquire::ForceIPv4=true install -y \
                 --no-install-recommends "${packages[@]}"
         fi
+        # Probe the binary, not /usr/lib/systemd: Devuan carries that
+        # directory via libsystemd while shipping no systemctl, and its
+        # openssh-server postinst already registers the sysv service.
         if [[ "$PREINSTALL_SSH" == "true" &&
-              -d "$rootfs/usr/lib/systemd" ]]; then
+              -x "$rootfs/usr/bin/systemctl" ]]; then
             chroot "$rootfs" systemctl enable ssh
         fi
         rm -rf "$rootfs/var/lib/apt/lists"/*
         rm -f "$rootfs/etc/resolv.conf"
-        if [[ -d "$rootfs/usr/lib/systemd" ]]; then
+        if [[ -x "$rootfs/usr/bin/systemctl" ]]; then
             ln -s ../run/systemd/resolve/stub-resolv.conf \
                 "$rootfs/etc/resolv.conf"
         fi
@@ -155,10 +158,15 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             packages+=(openssh)
         fi
+        # pacman's CheckSpace cannot resolve the cache dir mount point
+        # from inside a plain chroot and aborts with a bogus disk-full
+        # error; disable it for the install only.
+        sed -i 's/^CheckSpace/#CheckSpace/' "$rootfs/etc/pacman.conf"
         if ((${#packages[@]})); then
             chroot "$rootfs" pacman -Sy --noconfirm --needed \
                 "${packages[@]}"
         fi
+        sed -i 's/^#CheckSpace/CheckSpace/' "$rootfs/etc/pacman.conf"
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
             chroot "$rootfs" systemctl enable sshd
         fi
