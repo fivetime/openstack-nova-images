@@ -61,10 +61,19 @@ jobs:
         run: |
           sudo incus image list images: --format json > catalog.json
 
+          # One alias per image: the catalog lists the same image under a
+          # numeric and a codename alias (debian/12 + debian/bookworm);
+          # prefer the codename so each image builds exactly once.
           jq -r '.[]
               | select(.type == "container" and .architecture == "x86_64")
-              | (.aliases // [])[].name
-              | select(test("^[a-z0-9]+/[^/]+/cloud$"))' catalog.json \
+              | ((.aliases // []) | map(.name)
+                 | map(select(test("^[a-z0-9]+/[^/]+/cloud$")))) as $names
+              | select(($names | length) > 0)
+              | ($names
+                 | map(select(test("^[a-z0-9]+/[0-9.]+/cloud$") | not)))
+                as $codenames
+              | if ($codenames | length) > 0
+                then $codenames[0] else $names[0] end' catalog.json \
             | sort -u > aliases.txt
 
           matrix='[]'

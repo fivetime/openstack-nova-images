@@ -163,8 +163,15 @@ if [[ "$PREINSTALL_SSH" == "true" || -n "$PREINSTALL_PACKAGES" ]]; then
         # error; disable it for the install only.
         sed -i 's/^CheckSpace/#CheckSpace/' "$rootfs/etc/pacman.conf"
         if ((${#packages[@]})); then
-            chroot "$rootfs" pacman -Sy --noconfirm --needed \
-                "${packages[@]}"
+            # Arch mirrors time out intermittently; retry the sync.
+            for attempt in 1 2 3; do
+                if chroot "$rootfs" pacman -Sy --noconfirm --needed \
+                    "${packages[@]}"; then
+                    break
+                fi
+                ((attempt < 3)) || exit 1
+                sleep 15
+            done
         fi
         sed -i 's/^#CheckSpace/CheckSpace/' "$rootfs/etc/pacman.conf"
         if [[ "$PREINSTALL_SSH" == "true" ]]; then
