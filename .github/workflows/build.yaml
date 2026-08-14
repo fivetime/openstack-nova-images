@@ -66,6 +66,7 @@ jobs:
           - name: default
             devices:
               root:
+                type: disk
                 path: /
                 pool: default
           EOF
